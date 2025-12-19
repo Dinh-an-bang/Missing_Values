@@ -5,96 +5,85 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# 1. THIẾT LẬP ĐƯỜNG DẪN
 DATA_PATH = 'D:/CIC_IDS_Data' 
+SAVE_PATH = 'D:/CIC_IDS_Data/cleaned_data.parquet' # File sẽ lưu
 
-# Lấy danh sách tất cả các file CSV 
+#PHẦN 1: ĐỌC VÀ KẾT HỢP DỮ LIỆU
 all_files = glob.glob(os.path.join(DATA_PATH, "*.csv"))
-
 df_list = []
-print("BẮT ĐẦU KẾT HỢP DỮ LIỆU:")
-print(f"Tìm thấy {len(all_files)} tệp CSV.")
 
+print("BẮT ĐẦU ĐỌC DỮ LIỆU: ")
 for filename in all_files:
     try:
         df = pd.read_csv(filename, low_memory=False) 
         df_list.append(df)
-        print(f"Đã đọc thành công: {os.path.basename(filename)}")
+        print(f"Đã đọc: {os.path.basename(filename)}")
     except Exception as e:
-        print(f"Lỗi khi đọc {os.path.basename(filename)}. Vui lòng kiểm tra file: {e}")
+        print(f"Lỗi khi đọc {os.path.basename(filename)}: {e}")
 
-# Kết hợp tất cả các DataFrame thành một DataFrame lớn duy nhất
+# Kết hợp tất cả thành một DataFrame duy nhất
 df_combined = pd.concat(df_list, axis=0, ignore_index=True)
 
-print(f"\n--- BÁO CÁO TÓM TẮT DỮ LIỆU ---")
-print(f"Tổng số bản ghi (Flows) sau khi kết hợp: {len(df_combined)}")
+# Chuẩn hóa tên cột (Xóa khoảng trắng, thay bằng dấu gạch dưới)
+df_combined.columns = df_combined.columns.str.strip().str.replace(' ', '_')
 
-# 1. Chuẩn hóa tên cột và xử lý giá trị không hợp lệ
-df_combined.columns = df_combined.columns.str.strip() 
-df_combined.columns = df_combined.columns.str.replace(' ', '_') 
+print(f"\nTổng số dòng dữ liệu: {len(df_combined)}")
 
-# Thay thế giá trị vô cùng (Inf) và giá trị chuỗi không phải số bằng NaN
-df_combined.replace([np.inf, -np.inf, 'NaN', 'Infinity'], np.nan, inplace=True) 
+#PHẦN 2 và 3: KIỂM TRA (MISSING VALUES & OUTLIERS)
 
-#KIỂM TRA MISSING VALUES (DỮ LIỆU THIẾU)
-print("\nKIỂM TRA DỮ LIỆU THIẾU (MISSING VALUES):")
-
+# Kiểm tra Missing Values
 missing_percentage = (df_combined.isnull().sum() / len(df_combined)) * 100
-missing_cols = missing_percentage[missing_percentage > 0].sort_values(ascending=False)
+print("\nKIỂM TRA DỮ LIỆU THIẾU: ")
+print(missing_percentage[missing_percentage > 0])
 
-if not missing_cols.empty:
-    print("Các cột có Missing Values/Inf cần xử lý (tỷ lệ %):")
-    print(missing_cols.head(5)) 
-    print(f"\nTổng số cột có giá trị thiếu: {len(missing_cols)}")
-else:
-    print("Tuyệt vời! Không có Missing Values hoặc giá trị Inf nào được tìm thấy.")
-
-#KIỂM TRA MẤT CÂN BẰNG LỚP (CLASS IMBALANCE)
-print("\nKIỂM TRA MẤT CÂN BẰNG LỚP (IMBALANCE): ")
-
-df_combined['Label'] = df_combined['Label'].astype(str).str.strip() 
-
-label_counts = df_combined['Label'].value_counts()
-label_percentage = df_combined['Label'].value_counts(normalize=True) * 100
-
-imbalance_report = pd.DataFrame({
-    'Count': label_counts,
-    'Percentage': label_percentage.round(4)
-})
-print(imbalance_report)
-
-rare_classes = imbalance_report[imbalance_report['Percentage'] < 0.5]
-if not rare_classes.empty:
-    print("\nCẢNH BÁO MẤT CÂN BẰNG NGHIÊM TRỌNG (Các lớp dưới 0.5%):")
-    print(rare_classes)
-
-
-#PHẦN 2: KIỂM TRA OUTLIER
-
-# 1. Lấy danh sách các đặc trưng liên tục để kiểm tra Outlier
-flow_features_to_check = ['Flow_Duration', 'Total_Length_of_Fwd_Packets', 'Flow_Bytes/s']
-
+# Kiểm tra Outlier bằng Box Plot
 print("\nKIỂM TRA OUTLIER (GIÁ TRỊ NGOẠI LAI):")
-print("Box Plots sẽ được hiển thị trong cửa sổ riêng. (Chỉ hiển thị dữ liệu đến ngưỡng 99% để biểu đồ rõ ràng hơn)")
-
-# Thiết lập kích thước figure tổng thể
+flow_features_to_check = ['Flow_Duration', 'Total_Length_of_Fwd_Packets', 'Flow_Bytes/s']
 plt.figure(figsize=(15, 5)) 
-
 for i, feature in enumerate(flow_features_to_check):
-    # Tạo Box Plot cho từng đặc trưng
-    plt.subplot(1, 3, i + 1) # Tạo 1 hàng, 3 cột biểu đồ
-    
-    # Tính ngưỡng 99% để loại bỏ 1% giá trị cực lớn (Outlier mạnh)
+    plt.subplot(1, 3, i + 1)
     upper_bound = df_combined[feature].quantile(0.99)
-    
-    # Lọc dữ liệu: chỉ lấy các giá trị nhỏ hơn hoặc bằng ngưỡng 99%
     filtered_data = df_combined[df_combined[feature] <= upper_bound][feature]
-    
-    # Vẽ Box Plot
     sns.boxplot(y=filtered_data, color='skyblue')
-    plt.title(f'Box Plot: {feature} (Filtered @ 99%)', fontsize=10)
-    plt.ylabel(feature)
+    plt.title(f'Box Plot: {feature}')
+plt.tight_layout()
+plt.show()
+# sau khi chạy xong hãy đóng cửa sổ của cái box này mới có thể chạy tiếp
 
-plt.tight_layout() 
-plt.show() # Hiển thị các biểu đồ đã vẽ
+#PHẦN 4: LÀM SẠCH DỮ LIỆU (FEATURE ENGINEERING)
+print("\nBẮT ĐẦU LÀM SẠCH DỮ LIỆU (STEP 4): ")
 
-print("Đã tạo Box Plot cho các đặc trưng quan trọng.")
+# 4.1 Xử lý NaN và Inf
+df_combined.replace([np.inf, -np.inf, 'NaN', 'Infinity'], np.nan, inplace=True)
+df_combined.fillna(0, inplace=True)
+print("Đã xử lý NaN và Inf.")
+
+# 4.2 Loại bỏ các cột Metadata không cần thiết
+cols_to_drop = ['Flow_ID', 'Source_IP', 'Source_Port', 'Destination_IP', 'Destination_Port', 'Protocol', 'Timestamp']
+existing_cols_to_drop = [c for c in cols_to_drop if c in df_combined.columns]
+df_combined.drop(columns=existing_cols_to_drop, inplace=True)
+print(f"Đã loại bỏ các cột định danh: {existing_cols_to_drop}")
+
+# 4.3 Gộp nhãn để xử lý mất cân bằng
+def consolidate_label(label):
+    label = str(label).strip().upper()
+    if label == 'BENIGN': return 'Benign'
+    if 'DOS' in label or 'HEARTBLEED' in label: return 'DoS'
+    if 'DDOS' in label: return 'DDoS'
+    if 'WEB ATTACK' in label: return 'Web_Attack'
+    if 'PATATOR' in label: return 'Brute_Force'
+    if 'INFILTRATION' in label: return 'Infiltration'
+    if 'BOT' in label: return 'Bot'
+    return 'Other'
+
+df_combined['Label_Category'] = df_combined['Label'].apply(consolidate_label)
+
+print("\n--- THỐNG KÊ NHÃN SAU KHI GỘP ---")
+print(df_combined['Label_Category'].value_counts())
+
+#LƯU DỮ LIỆU RA FILE PARQUET
+print("\n ĐANG LƯU DỮ LIỆU SẠCH (Vui lòng đợi một chút)...")
+df_combined.to_parquet(SAVE_PATH, index=False)
+
+print(f"File dữ liệu sạch đã được làm lại và lưu tại bằng thư viện parquet: {SAVE_PATH}")
