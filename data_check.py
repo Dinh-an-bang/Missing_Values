@@ -2,18 +2,16 @@ import pandas as pd
 import numpy as np
 import glob
 import os
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 # 1. THIẾT LẬP ĐƯỜNG DẪN
 DATA_PATH = 'D:/CIC_IDS_Data' 
-SAVE_PATH = 'D:/CIC_IDS_Data/cleaned_data.parquet' # File sẽ lưu
+SAVE_PATH = 'D:/CIC_IDS_Data/step4_cleaned_balanced.parquet'
 
-#PHẦN 1: ĐỌC VÀ KẾT HỢP DỮ LIỆU
+# --- PHẦN 1: ĐỌC VÀ KẾT HỢP DỮ LIỆU ---
 all_files = glob.glob(os.path.join(DATA_PATH, "*.csv"))
 df_list = []
 
-print("BẮT ĐẦU ĐỌC DỮ LIỆU: ")
+print("BẮT ĐẦU QUY TRÌNH TIỀN XỬ LÝ TỔNG HỢP...")
 for filename in all_files:
     try:
         df = pd.read_csv(filename, low_memory=False) 
@@ -22,68 +20,64 @@ for filename in all_files:
     except Exception as e:
         print(f"Lỗi khi đọc {os.path.basename(filename)}: {e}")
 
-# Kết hợp tất cả thành một DataFrame duy nhất
 df_combined = pd.concat(df_list, axis=0, ignore_index=True)
-
-# Chuẩn hóa tên cột (Xóa khoảng trắng, thay bằng dấu gạch dưới)
+# Chuẩn hóa tên cột để dễ làm việc
 df_combined.columns = df_combined.columns.str.strip().str.replace(' ', '_')
+print(f"Tổng số dòng gốc: {len(df_combined)}")
 
-print(f"\nTổng số dòng dữ liệu: {len(df_combined)}")
-
-#PHẦN 2 và 3: KIỂM TRA (MISSING VALUES & OUTLIERS)
-
-# Kiểm tra Missing Values
-missing_percentage = (df_combined.isnull().sum() / len(df_combined)) * 100
-print("\nKIỂM TRA DỮ LIỆU THIẾU: ")
-print(missing_percentage[missing_percentage > 0])
-
-# Kiểm tra Outlier bằng Box Plot
-print("\nKIỂM TRA OUTLIER (GIÁ TRỊ NGOẠI LAI):")
-flow_features_to_check = ['Flow_Duration', 'Total_Length_of_Fwd_Packets', 'Flow_Bytes/s']
-plt.figure(figsize=(15, 5)) 
-for i, feature in enumerate(flow_features_to_check):
-    plt.subplot(1, 3, i + 1)
-    upper_bound = df_combined[feature].quantile(0.99)
-    filtered_data = df_combined[df_combined[feature] <= upper_bound][feature]
-    sns.boxplot(y=filtered_data, color='skyblue')
-    plt.title(f'Box Plot: {feature}')
-plt.tight_layout()
-plt.show()
-# sau khi chạy xong hãy đóng cửa sổ của cái box này mới có thể chạy tiếp
-
-#PHẦN 4: LÀM SẠCH DỮ LIỆU (FEATURE ENGINEERING)
-print("\nBẮT ĐẦU LÀM SẠCH DỮ LIỆU (STEP 4): ")
-
-# 4.1 Xử lý NaN và Inf
-df_combined.replace([np.inf, -np.inf, 'NaN', 'Infinity'], np.nan, inplace=True)
+# --- PHẦN 2: DỌN DẸP LỖI KỸ THUẬT (NaN & Inf) ---
+# Thay thế tất cả các dạng lỗi bằng NaN rồi đưa về 0
+df_combined.replace([np.inf, -np.inf, 'NaN', 'Infinity', 'infinity'], np.nan, inplace=True)
 df_combined.fillna(0, inplace=True)
-print("Đã xử lý NaN và Inf.")
+print("Đã xử lý triệt để các lỗi NaN và Infinity.")
 
-# 4.2 Loại bỏ các cột Metadata không cần thiết
+# --- PHẦN 3: LOẠI BỎ METADATA (Tránh học vẹt) ---
+# Xóa các cột định danh để mô hình tập trung vào hành vi flow
 cols_to_drop = ['Flow_ID', 'Source_IP', 'Source_Port', 'Destination_IP', 'Destination_Port', 'Protocol', 'Timestamp']
-existing_cols_to_drop = [c for c in cols_to_drop if c in df_combined.columns]
-df_combined.drop(columns=existing_cols_to_drop, inplace=True)
-print(f"Đã loại bỏ các cột định danh: {existing_cols_to_drop}")
+existing_cols = [c for c in cols_to_drop if c in df_combined.columns]
+df_combined.drop(columns=existing_cols, inplace=True)
+print(f"Đã loại bỏ các cột định danh: {existing_cols}")
 
-# 4.3 Gộp nhãn để xử lý mất cân bằng
+# --- PHẦN 4: GỘP NHÃN (Label Consolidation) ---
 def consolidate_label(label):
     label = str(label).strip().upper()
     if label == 'BENIGN': return 'Benign'
     if 'DOS' in label or 'HEARTBLEED' in label: return 'DoS'
     if 'DDOS' in label: return 'DDoS'
-    if 'WEB ATTACK' in label: return 'Web_Attack'
-    if 'PATATOR' in label: return 'Brute_Force'
     if 'INFILTRATION' in label: return 'Infiltration'
-    if 'BOT' in label: return 'Bot'
+    if 'PATATOR' in label: return 'Brute_Force'
+    if 'BOT' in label or 'WEB ATTACK' in label: return 'Other_Attack'
     return 'Other'
 
 df_combined['Label_Category'] = df_combined['Label'].apply(consolidate_label)
 
-print("\n--- THỐNG KÊ NHÃN SAU KHI GỘP ---")
-print(df_combined['Label_Category'].value_counts())
+# --- PHẦN 5: CÂN BẰNG DỮ LIỆU THÔNG MINH (Đúng ý thầy) ---
+print("Đang thực hiện cân bằng dữ liệu chú ý tới thời gian...")
 
-#LƯU DỮ LIỆU RA FILE PARQUET
-print("\n ĐANG LƯU DỮ LIỆU SẠCH (Vui lòng đợi một chút)...")
-df_combined.to_parquet(SAVE_PATH, index=False)
+# Tách nhóm
+df_benign = df_combined[df_combined['Label_Category'] == 'Benign']
+df_attack = df_combined[df_combined['Label_Category'] != 'Benign']
 
-print(f"File dữ liệu sạch đã được làm lại và lưu tại bằng thư viện parquet: {SAVE_PATH}")
+# 1. Systematic Sampling cho Benign (Giảm xuống còn 500,000 dòng để cân bằng)
+# Việc dùng iloc[::step] giúp giữ lại các mẫu trải dài theo thời gian
+step_size = len(df_benign) // 500000
+df_benign_balanced = df_benign.iloc[::step_size, :].copy()
+
+# 2. Oversampling cho Infiltration (Lớp quá ít mẫu - 36 dòng)
+df_infiltration = df_attack[df_attack['Label_Category'] == 'Infiltration']
+df_inf_boosted = pd.concat([df_infiltration] * 100, ignore_index=True)
+
+# 3. Giữ nguyên các loại tấn công khác
+df_attack_others = df_attack[df_attack['Label_Category'] != 'Infiltration']
+
+# --- PHẦN 6: HỢP NHẤT VÀ BẢO TOÀN THỨ TỰ ---
+# Sử dụng sort_index() để đảm bảo các flow mạng quay về đúng trình tự xảy ra
+df_final = pd.concat([df_benign_balanced, df_attack_others, df_inf_boosted]).sort_index()
+
+print("\n--- THỐNG KÊ CUỐI CÙNG SAU KHI LÀM SẠCH VÀ CÂN BẰNG ---")
+print(df_final['Label_Category'].value_counts())
+
+# --- PHẦN 7: LƯU TRỮ HIỆU NĂNG CAO ---
+print("\n Đang lưu dữ liệu vào định dạng Parquet...")
+df_final.to_parquet(SAVE_PATH, index=False)
+print(f" HOÀN THÀNH! Dữ liệu sạch đã sẵn sàng tại: {SAVE_PATH}")
