@@ -2,43 +2,39 @@ import pandas as pd
 import numpy as np
 import glob
 import os
+import torch
+import torch.nn.functional as F
+import networkx as nx
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv
+from torch.optim import Adam
 
-# 1. THIẾT LẬP ĐƯỜNG DẪN
+#PHẦN 1: THIẾT LẬP VÀ TIỀN XỬ LÝ
 DATA_PATH = 'D:/CIC_IDS_Data' 
-SAVE_PATH = 'D:/CIC_IDS_Data/step4_cleaned_balanced.parquet'
+SAVE_GRAPH_PATH = 'D:/CIC_IDS_Data/final_graph_data.pt'
 
-# --- PHẦN 1: ĐỌC VÀ KẾT HỢP DỮ LIỆU ---
 all_files = glob.glob(os.path.join(DATA_PATH, "*.csv"))
 df_list = []
-
-print("BẮT ĐẦU QUY TRÌNH TIỀN XỬ LÝ TỔNG HỢP...")
+print("Processing: Reading CSV files...")
 for filename in all_files:
     try:
         df = pd.read_csv(filename, low_memory=False) 
         df_list.append(df)
-        print(f"Đã đọc: {os.path.basename(filename)}")
-    except Exception as e:
-        print(f"Lỗi khi đọc {os.path.basename(filename)}: {e}")
+    except Exception as e: print(f"Error: {e}")
 
 df_combined = pd.concat(df_list, axis=0, ignore_index=True)
-# Chuẩn hóa tên cột để dễ làm việc
 df_combined.columns = df_combined.columns.str.strip().str.replace(' ', '_')
-print(f"Tổng số dòng gốc: {len(df_combined)}")
-
-# --- PHẦN 2: DỌN DẸP LỖI KỸ THUẬT (NaN & Inf) ---
-# Thay thế tất cả các dạng lỗi bằng NaN rồi đưa về 0
-df_combined.replace([np.inf, -np.inf, 'NaN', 'Infinity', 'infinity'], np.nan, inplace=True)
+df_combined.replace([np.inf, -np.inf, 'NaN', 'Infinity'], np.nan, inplace=True)
 df_combined.fillna(0, inplace=True)
-print("Đã xử lý triệt để các lỗi NaN và Infinity.")
 
-# --- PHẦN 3: LOẠI BỎ METADATA (Tránh học vẹt) ---
-# Xóa các cột định danh để mô hình tập trung vào hành vi flow
+# Loại bỏ metadata và gộp nhãn
 cols_to_drop = ['Flow_ID', 'Source_IP', 'Source_Port', 'Destination_IP', 'Destination_Port', 'Protocol', 'Timestamp']
-existing_cols = [c for c in cols_to_drop if c in df_combined.columns]
-df_combined.drop(columns=existing_cols, inplace=True)
-print(f"Đã loại bỏ các cột định danh: {existing_cols}")
+df_combined.drop(columns=[c for c in cols_to_drop if c in df_combined.columns], inplace=True)
 
-# --- PHẦN 4: GỘP NHÃN (Label Consolidation) ---
 def consolidate_label(label):
     label = str(label).strip().upper()
     if label == 'BENIGN': return 'Benign'
@@ -51,33 +47,82 @@ def consolidate_label(label):
 
 df_combined['Label_Category'] = df_combined['Label'].apply(consolidate_label)
 
-# --- PHẦN 5: CÂN BẰNG DỮ LIỆU THÔNG MINH (Đúng ý thầy) ---
-print("Đang thực hiện cân bằng dữ liệu chú ý tới thời gian...")
-
-# Tách nhóm
+# Cân bằng dữ liệu (Systematic Sampling cho Benign)
 df_benign = df_combined[df_combined['Label_Category'] == 'Benign']
 df_attack = df_combined[df_combined['Label_Category'] != 'Benign']
-
-# 1. Systematic Sampling cho Benign (Giảm xuống còn 500,000 dòng để cân bằng)
-# Việc dùng iloc[::step] giúp giữ lại các mẫu trải dài theo thời gian
-step_size = len(df_benign) // 500000
+step_size = max(1, len(df_benign) // 500000)
 df_benign_balanced = df_benign.iloc[::step_size, :].copy()
+df_inf_boosted = pd.concat([df_attack[df_attack['Label_Category'] == 'Infiltration']] * 100, ignore_index=True)
+df_final = pd.concat([df_benign_balanced, df_attack[df_attack['Label_Category'] != 'Infiltration'], df_inf_boosted]).sort_index()
 
-# 2. Oversampling cho Infiltration (Lớp quá ít mẫu - 36 dòng)
-df_infiltration = df_attack[df_attack['Label_Category'] == 'Infiltration']
-df_inf_boosted = pd.concat([df_infiltration] * 100, ignore_index=True)
+# Chuẩn hóa
+scaler = RobustScaler()
+x_scaled = scaler.fit_transform(df_final.drop(columns=['Label', 'Label_Category']))
+label_map = {cat: i for i, cat in enumerate(df_final['Label_Category'].unique())}
+y_tensor = torch.tensor(df_final['Label_Category'].map(label_map).values, dtype=torch.long)
 
-# 3. Giữ nguyên các loại tấn công khác
-df_attack_others = df_attack[df_attack['Label_Category'] != 'Infiltration']
+# PHẦN 2: XÂY DỰNG ĐỒ THỊ
+print("Processing: Constructing Graph...")
+num_nodes = x_scaled.shape[0]
+src, dst = [], []
+for i in range(num_nodes - 1):
+    src.extend([i, i]); dst.extend([i + 1, i + 2 if i + 2 < num_nodes else i + 1])
 
-# --- PHẦN 6: HỢP NHẤT VÀ BẢO TOÀN THỨ TỰ ---
-# Sử dụng sort_index() để đảm bảo các flow mạng quay về đúng trình tự xảy ra
-df_final = pd.concat([df_benign_balanced, df_attack_others, df_inf_boosted]).sort_index()
+edge_index = torch.tensor([src, dst], dtype=torch.long)
+graph_data = Data(x=torch.tensor(x_scaled, dtype=torch.float), edge_index=edge_index, y=y_tensor)
+torch.save(graph_data, SAVE_GRAPH_PATH)
 
-print("\n--- THỐNG KÊ CUỐI CÙNG SAU KHI LÀM SẠCH VÀ CÂN BẰNG ---")
-print(df_final['Label_Category'].value_counts())
+#PHẦN 3: HUẤN LUYỆN MÔ HÌNH GNN
+class GCN_IDS(torch.nn.Module):
+    def __init__(self, num_features, num_classes):
+        super(GCN_IDS, self).__init__()
+        self.conv1 = GCNConv(num_features, 64)
+        self.conv2 = GCNConv(64, 32)
+        self.classifier = torch.nn.Linear(32, num_classes)
 
-# --- PHẦN 7: LƯU TRỮ HIỆU NĂNG CAO ---
-print("\n Đang lưu dữ liệu vào định dạng Parquet...")
-df_final.to_parquet(SAVE_PATH, index=False)
-print(f" HOÀN THÀNH! Dữ liệu sạch đã sẵn sàng tại: {SAVE_PATH}")
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = F.relu(self.conv2(x, edge_index))
+        return F.log_softmax(self.classifier(x), dim=1)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = GCN_IDS(graph_data.num_node_features, len(label_map)).to(device)
+graph_data = graph_data.to(device)
+optimizer = Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+criterion = torch.nn.CrossEntropyLoss()
+
+# Chia mask 80/20
+indices = torch.randperm(graph_data.num_nodes)
+train_mask = indices[:int(graph_data.num_nodes * 0.8)]
+test_mask = indices[int(graph_data.num_nodes * 0.8):]
+
+print(f"Training on {device}...")
+for epoch in range(1, 51):
+    model.train()
+    optimizer.zero_grad(); out = model(graph_data)
+    loss = criterion(out[train_mask], graph_data.y[train_mask])
+    loss.backward(); optimizer.step()
+    if epoch % 10 == 0: print(f'Epoch: {epoch:03d}, Loss: {loss.item():.4f}')
+
+#PHẦN 4: ĐÁNH GIÁ
+print("\nEvaluating Model...")
+model.eval()
+with torch.no_grad():
+    out = model(graph_data)
+    pred = out.argmax(dim=1)
+
+y_true = graph_data.y[test_mask].cpu().numpy()
+y_pred = pred[test_mask].cpu().numpy()
+target_names = list(label_map.keys())
+
+print(f"\nAccuracy: {accuracy_score(y_true, y_pred)*100:.2f}%")
+print(classification_report(y_true, y_pred, target_names=target_names))
+
+# Vẽ Confusion Matrix
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', xticklabels=target_names, yticklabels=target_names, cmap='Blues')
+plt.title('Confusion Matrix - GNN Performance')
+plt.show()
